@@ -218,15 +218,9 @@ your container ID or name, and ``<GATEWAY_IP>`` with the gateway from
      "http" "<GATEWAY_IP>:8780" "http://nextcloud.local" \
      --harp \
      --harp_shared_key "some_very_secure_password" \
-     --harp_frp_address "<GATEWAY_IP>:8782" \
      --k8s \
      --k8s_expose_type=nodeport \
      --set-default
-
-.. note::
-
-   While the ``--harp_frp_address`` is a required argument for the ``docker`` command,
-   it is not used by Kubernetes at all.
 
 Verify:
 
