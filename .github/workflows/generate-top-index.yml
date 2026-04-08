@@ -61,15 +61,25 @@ jobs:
         git config --local user.email "nextcloud-command@users.noreply.github.com"
         git config --local user.name "nextcloud-command"
     
-    - name: Commit and push changes
+    - name: Create Pull Request for documentation index deployment
       if: github.event_name == 'push'
-      run: |
-        # Move the generated index.html and static files to the root of the gh-pages branch
-        rm -rf index.html static/
-        mv /tmp/index.html index.html
-        mv /tmp/static/ static/
-        git add index.html static/
-        git commit -m "chore: update index.html for documentation" || echo "No changes to commit"
-        git push origin gh-pages || echo "Nothing to push (expected if no changes)"
+      uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0 # v8.1.0
+      id: cpr
+      with:
+        token: ${{ secrets.COMMAND_BOT_PAT }}
+        commit-message: 'chore: deploy documentation index for ${{ github.ref_name }}'
+        committer: nextcloud-command <nextcloud-command@users.noreply.github.com>
+        author: nextcloud-command <nextcloud-command@users.noreply.github.com>
+        signoff: true
+        branch: 'automated/deploy/documentation-index-${{ github.ref_name }}'
+        base: gh-pages
+        title: 'Deploy documentation index for ${{ needs.stage.outputs.branch_name }}'
+        body: 'Automated documentation index deployment from branch ${{ github.ref_name }}'
+        delete-branch: true
+        labels: 'automated, 3. to review'
+  
+    - name: Enable Pull Request Automerge
+      if: github.event_name == 'push'
+      run: gh pr merge --merge --auto "${{ steps.cpr.outputs.pull-request-number }}"
       env:
         GH_TOKEN: ${{ secrets.COMMAND_BOT_PAT }}
