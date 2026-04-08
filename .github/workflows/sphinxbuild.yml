@@ -158,9 +158,133 @@ jobs:
         name: ${{ matrix.manual.name }}
         path: ${{ matrix.manual.directory }}/${{ matrix.manual.build_path }}
 
+  stage-and-check:
+    name: Stage and check documentation
+    needs: build
+    runs-on: ubuntu-latest
+
+    outputs:
+      # branch_name: The primary deployment folder name for this branch
+      #   - master → "latest"
+      #   - stable<N> (if highest) → "stable"
+      #   - stable<N> (if not highest) → "<N>" (numeric version)
+      branch_name: ${{ steps.branch.outputs.branch_name }}
+      
+      # additional_deployment: ONLY set if deploying the highest stable branch
+      #   - If this IS the highest stable → "<N>" (numeric version, e.g. "32")
+      #   - Otherwise → "" (empty string)
+      # 
+      # This allows the highest stable to be deployed to TWO locations:
+      #   server/stable/    (via branch_name)
+      #   server/<N>/       (via additional_deployment)
+      additional_deployment: ${{ steps.branch.outputs.additional_deployment }}
+
+    steps:
+      - name: Cache git metadata
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: .git
+          key: git-metadata-${{ github.sha }}
+          restore-keys: |
+            git-metadata-${{ github.sha }}
+            git-metadata
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts/
+
+      - name: Get branch name and find latest stable
+        id: branch
+        run: |
+          current_branch="${GITHUB_REF#refs/heads/}"
+
+          # Find the highest numbered stable branch from the remote
+          highest_stable=$(git ls-remote --heads origin | sed -n 's?.*refs/heads/stable\([0-9]\{2\}\)$?\1?p' | sort -n | tail -1)
+          highest_stable_branch="stable${highest_stable}"
+
+          echo "Current branch: $current_branch"
+          echo "Highest stable branch found: $highest_stable_branch"
+
+          # Map actual branch names to deployment folder names
+          case "$current_branch" in
+            "master")
+              echo "branch_name=latest" >> $GITHUB_OUTPUT
+              ;;
+            "$highest_stable_branch")
+              echo "branch_name=stable" >> $GITHUB_OUTPUT
+              # Also record the numeric version so we can publish to server/<number>/ too
+              echo "additional_deployment=${highest_stable}" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              # Remove stable prefix for current branch
+              current_branch="${current_branch#stable}"
+              echo "branch_name=$current_branch" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+          echo "Deployment folder name: ${{ steps.branch.outputs.branch_name }}"
+          echo "Additional deployment: ${{ steps.branch.outputs.additional_deployment }}"
+
+      - name: Stage documentation for deployment
+        run: |
+          # Create deploy staging directory
+          mkdir -p deploy-staging/server/${{ steps.branch.outputs.branch_name }}
+
+          # List artifacts for debugging
+          ls -la artifacts/
+
+          # Copy all built documentation into dedicated subdirectories
+          for artifact in artifacts/*; do
+            if [ -d "$artifact" ]; then
+              manual_name="$(basename "$artifact")"
+              mkdir -p "deploy-staging/server/${{ steps.branch.outputs.branch_name }}/$manual_name"
+              cp -r "$artifact/"* "deploy-staging/server/${{ steps.branch.outputs.branch_name }}/$manual_name/"
+            fi
+          done
+
+          # Move pdf files to the root of the branch_name
+          find deploy-staging/server/${{ steps.branch.outputs.branch_name }} -maxdepth 2 -name "*.pdf" -exec mv {} deploy-staging/server/${{ steps.branch.outputs.branch_name }}/ \;
+
+          # If this is the highest stable branch, also stage to its versioned folder
+          additional="${{ steps.branch.outputs.additional_deployment }}"
+          if [ -n "${additional}" ]; then
+            echo "Also deploying to server/${additional}/ (additional versioned deployment)"
+            mkdir -p "deploy-staging/server/${additional}"
+            cp -r "deploy-staging/server/${{ steps.branch.outputs.branch_name }}/"* "deploy-staging/server/${additional}/"
+          fi
+
+          # Clean up empty directories
+          find deploy-staging -type d -empty -delete
+
+          # Log the final directory structure for debugging
+          echo "Final deploy-staging/ structure:"
+          find deploy-staging -type d -maxdepth 2
+
+      - name: Upload documentation artifacts for deployment
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: deploy-staging
+          path: deploy-staging/
+
+      - name: Check for broken links with lychee
+        uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2.8.0
+        with:
+          fail: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          jobSummary: true
+          args: |
+            --root $(pwd)/deploy-staging
+            --offline --no-progress --verbose
+            --remap "https://docs.nextcloud.com/server/ file://$(pwd)/deploy-staging/"
+            'deploy-staging/server/${{ steps.branch.outputs.branch_name }}/**/*.html'
+
   deploy:
     name: Deploy pages
-    needs: build
+    needs: [build, stage-and-check]
     runs-on: ubuntu-latest
     if: github.event_name == 'push'  # Only deploy on push, not PR
 
@@ -168,120 +292,80 @@ jobs:
       contents: write
 
     steps:
-    - name: Cache git metadata
-      uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
-      with:
-        path: .git
-        key: git-metadata-${{ github.sha }}
-        restore-keys: |
-          git-metadata-${{ github.sha }}
-          git-metadata
+      - name: Checkout Github Pages branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: gh-pages
+          fetch-depth: 0
+          token: ${{ secrets.COMMAND_BOT_PAT }}
 
-    - name: Checkout Github Pages branch
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      with:
-        ref: gh-pages
-        fetch-depth: 0
-        token: ${{ secrets.COMMAND_BOT_PAT }}
+      - name: Download staging artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deploy-staging
+          path: .
 
-    - name: Download all ${{ needs.build.outputs.branch_name }} artifacts
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-      with:
-        path: artifacts/
+      - name: Merge staged documentation into gh-pages
+        run: |
+          # Ensure server directory exists
+          mkdir -p server
 
-    - name: Get branch name and find latest stable
-      id: branch
-      run: |
-        current_branch="${GITHUB_REF#refs/heads/}"
+          # Copy deployed files to server directory
+          ls -la deploy-staging/server/
+          cp -r deploy-staging/server/* server/ || true
 
-        # Find the highest numbered stable branch from the remote
-        highest_stable=$(git ls-remote --heads origin | sed -n 's?.*refs/heads/stable\([0-9]\{2\}\)$?\1?p' | sort -n | tail -1)
-        highest_stable_branch="stable${highest_stable}"
+          # Fetch source branches so git checkout origin/... works from the gh-pages checkout
+          git fetch origin ${{ github.event.repository.default_branch }} ${{ github.ref_name }}
 
-        echo "Current branch: $current_branch"
-        echo "Highest stable branch found: $highest_stable_branch"
+          # Generate go.php redirect from main branch
+          git checkout origin/${{ github.event.repository.default_branch }} -- go.php/index.html
+          mkdir -p server/${{ needs.stage-and-check.outputs.branch_name }}/go.php
+          mv go.php/index.html server/${{ needs.stage-and-check.outputs.branch_name }}/go.php/index.html
 
-        # Map actual branch names to deployment folder names
-        case "$current_branch" in
-          "master")
-            echo "branch_name=latest" >> $GITHUB_OUTPUT
-            ;;
-          "$highest_stable_branch")
-            echo "branch_name=stable" >> $GITHUB_OUTPUT
-            # Also record the numeric version so we can publish to server/<number>/ too
-            echo "version_name=${highest_stable}" >> $GITHUB_OUTPUT
-            ;;
-          *)
-            # Remove stable prefix for current branch
-            current_branch="${current_branch#stable}"
-            echo "branch_name=$current_branch" >> $GITHUB_OUTPUT
-            ;;
-        esac
+          # Generate user_manual english redirect
+          git checkout origin/${{ github.ref_name }} -- user_manual/index.html
+          mkdir -p server/${{ needs.stage-and-check.outputs.branch_name }}/user_manual
+          mv user_manual/index.html server/${{ needs.stage-and-check.outputs.branch_name }}/user_manual/index.html
 
-        echo "Deployment folder name: ${{ steps.branch.outputs.branch_name }}"
-        echo "Version name for additional deployment (if applicable): ${{ steps.branch.outputs.version_name }}"
-
-    - name: Merge ${{ steps.branch.outputs.branch_name }} documentation artifacts into gh-pages
-      run: |
-        # List artifacts
-        ls -la artifacts/*/
-
-        # Cleanup old documentation
-        rm -rf ${{ steps.branch.outputs.branch_name }}
-        rm -rf server/${{ steps.branch.outputs.branch_name }}
-        mkdir -p server/${{ steps.branch.outputs.branch_name }}
-
-        # Copy all built documentation into dedicated subdirectories
-        for artifact in artifacts/*; do
-          if [ -d "$artifact" ]; then
-            manual_name="$(basename "$artifact")"
-            mkdir -p "server/${{ steps.branch.outputs.branch_name }}/$manual_name"
-            cp -r "$artifact/"* "server/${{ steps.branch.outputs.branch_name }}/$manual_name/"
+          # If this is the highest stable branch, also deploy to its versioned folder
+          additional="${{ needs.stage-and-check.outputs.additional_deployment }}"
+          if [ -n "${additional}" ]; then
+            echo "Also deploying to server/${additional}/ (additional versioned deployment)"
+            rm -rf "server/${additional}"
+            cp -r "server/${{ needs.stage-and-check.outputs.branch_name }}" "server/${additional}"
           fi
-        done
 
-        # Move pdf files to the root of the branch_name
-        mv server/${{ steps.branch.outputs.branch_name }}/*/*.pdf server/${{ steps.branch.outputs.branch_name }}/ || true
+          # Clean up empty directories
+          find . -type d -empty -delete
 
-        # If this is the highest stable branch, also deploy to its versioned folder
-        if [ -n "${{ steps.branch.outputs.version_name }}" ]; then
-          rm -rf server/${{ steps.branch.outputs.version_name }}
-          cp -r server/${{ steps.branch.outputs.branch_name }} server/${{ steps.branch.outputs.version_name }}
-        fi
+          # Log the final directory structure for debugging
+          echo "Final server/ structure:"
+          find server -type d -maxdepth 2
 
-        # Cleanup
-        find . -type d -empty -delete
-        rm -rf artifacts
+      - name: Create Pull Request for documentation deployment
+        uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0 # v8.1.0
+        id: cpr
+        with:
+          token: ${{ secrets.COMMAND_BOT_PAT }}
+          commit-message: "chore: deploy documentation for ${{ needs.stage-and-check.outputs.branch_name }}"
+          committer: nextcloud-command <nextcloud-command@users.noreply.github.com>
+          author: nextcloud-command <nextcloud-command@users.noreply.github.com>
+          signoff: true
+          branch: "automated/deploy/documentation-${{ needs.stage-and-check.outputs.branch_name }}"
+          base: gh-pages
+          title: "Deploy documentation for ${{ needs.stage-and-check.outputs.branch_name }}"
+          body: "Automated documentation deployment from branch ${{ github.ref_name }}"
+          delete-branch: true
+          labels: "automated, 3. to review"
 
-    - name: Add various redirects for go.php and user_manual english version
-      run: |
-        # Fetch source branches so git checkout origin/... works from the gh-pages checkout
-        git fetch origin ${{ github.event.repository.default_branch }} ${{ github.ref_name }}
-
-        # Generate go.php redirect from main branch
-        git checkout origin/${{ github.event.repository.default_branch }} -- go.php/index.html
-        mkdir -p server/${{ steps.branch.outputs.branch_name }}/go.php
-        mv go.php/index.html server/${{ steps.branch.outputs.branch_name }}/go.php/index.html
-
-        # Generate user_manual english redirect
-        git checkout origin/${{ github.ref_name }} -- user_manual/index.html
-        mkdir -p server/${{ steps.branch.outputs.branch_name }}/user_manual
-        mv user_manual/index.html server/${{ steps.branch.outputs.branch_name }}/user_manual/index.html
-
-    - name: Commit ${{ steps.branch.outputs.branch_name }} documentation and push to gh-pages
-      run: |
-        git config --local user.email "nextcloud-command@users.noreply.github.com"
-        git config --local user.name "nextcloud-command"
-        git add .
-        git diff --staged --quiet || git commit -m "chore: deploy documentation for ${{ steps.branch.outputs.branch_name }}"
-        # Ensure we are up to date with the remote gh-pages branch
-        git pull --rebase origin gh-pages || true
-        git push origin gh-pages || echo "Nothing to push (expected if no changes)"
-      env:
-        GH_TOKEN: ${{ secrets.COMMAND_BOT_PAT }}
+      - name: Enable Pull Request Automerge
+        run: gh pr merge --merge --auto "${{ steps.cpr.outputs.pull-request-number }}"
+        if: steps.cpr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ secrets.COMMAND_BOT_PAT }}
 
   summary:
-    needs: build
+    needs: [build, stage-and-check, deploy]
     runs-on: ubuntu-latest-low
     if: always()
 
@@ -291,6 +375,6 @@ jobs:
     name: build-deploy-summary
 
     steps:
-      # Only check if the build was successful
       - name: Summary status
-        run: if ${{ needs.build.result != 'success' }}; then exit 1; fi
+        run: if ${{ needs.build.result != 'success' || needs.stage-and-check.result != 'success' || needs.deploy.result != 'success' }}; then exit 1; fi
+
