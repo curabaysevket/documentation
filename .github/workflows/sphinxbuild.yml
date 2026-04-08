@@ -290,7 +290,6 @@ jobs:
     name: Deploy pages
     needs: [build, stage-and-check]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'  # Only deploy on push, not PR
 
     permissions:
       contents: write
