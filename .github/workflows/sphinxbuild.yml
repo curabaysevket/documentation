@@ -242,7 +242,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: gh-pages
-          fetch-depth: 0
+          fetch-depth: 1
           path: validation-context
 
       # ========================================================================
@@ -305,69 +305,78 @@ jobs:
           echo "Additional deployment folder (if applicable): ${{ steps.branch.outputs.additional_deployment }}"
 
       # ========================================================================
-      # BUILD FULL DEPLOYMENT STRUCTURE
+      # ORGANIZE ARTIFACTS FOR DEPLOYMENT
       # ========================================================================
-      # Build the complete gh-pages structure in deploy-staging/ so that:
-      # 1. Lychee can validate the new content in its actual deployment context
-      # 2. The staged site includes existing versions (for cross-version link validation)
-      # 3. The staged site is ready to be copied directly to gh-pages
+      # Create a clean, minimal staging structure:
+      # - Deploy only the NEW artifacts for this branch
+      # - No need to include existing versions (we'll merge them during deploy)
       # ========================================================================
-      - name: Build full deployment structure
+      - name: Organize artifacts for deployment
+        id: organize
         run: |
           branch="${{ steps.branch.outputs.branch_name }}"
-          additional="${{ steps.branch.outputs.additional_deployment }}"
 
-          # Start with existing gh-pages content (all current versions)
-          mkdir -p deploy-staging/server
-          cp -r validation-context/server/* deploy-staging/server/ || true
-
-          # Organize new artifacts into the deployment structure
+          # Create the branch folder directly
           mkdir -p "deploy-staging/${branch}"
 
+          # Copy artifacts preserving their manual folder structure
+          # Each artifact (user_manual, admin_manual, developer_manual) contains
+          # the build output that should be placed in a folder named after the artifact
           for artifact in artifacts/*; do
             if [ -d "$artifact" ]; then
               manual_name="$(basename "$artifact")"
-              mkdir -p "deploy-staging/${branch}/$manual_name"
-              cp -r "$artifact/"* "deploy-staging/${branch}/$manual_name/"
+              # Create the manual-specific folder
+              mkdir -p "deploy-staging/${branch}/${manual_name}"
+              # Copy artifact contents into the manual folder
+              cp -r "$artifact/"* "deploy-staging/${branch}/${manual_name}/"
             fi
           done
 
-          # Move PDF files to the root of the branch folder
-          mv "deploy-staging/${branch}"/*/*.pdf "deploy-staging/${branch}/" || true
-
-          # If this is the highest stable, also prepare the additional deployment folder
-          if [ -n "${additional}" ]; then
-            mkdir -p "deploy-staging/${additional}"
-            cp -r "deploy-staging/${branch}"/* "deploy-staging/${additional}/"
-          fi
+          # Move PDF files to the root of the branch folder for cleaner structure
+          find "deploy-staging/${branch}/" -maxdepth 2 -name "*.pdf" -type f -exec mv {} "deploy-staging/${branch}/" \;
 
           # Clean up empty directories
           find deploy-staging -type d -empty -delete
 
-          echo "Full deployment structure prepared:"
-          find deploy-staging -type d -maxdepth 2
+          echo "Staged artifacts for ${branch}:"
+          find deploy-staging -type f | head -20
 
       # ========================================================================
       # UPLOAD STAGING ARTIFACTS
       # ========================================================================
-      # Upload only the minimal, organized artifacts needed for deployment.
-      # The deploy job will download this and place it in the correct location
-      # on the gh-pages branch.
+      # Upload only the NEW artifacts in their branch structure.
+      # The deploy job will handle merging with existing versions on gh-pages.
       # ========================================================================
       - name: Upload staged artifacts
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: staged-site
+          name: staged-documentation-${{ steps.branch.outputs.branch_name }}
           path: deploy-staging/
 
       # ========================================================================
       # VALIDATION: CHECK FOR BROKEN LINKS (NEW CONTENT IN FULL CONTEXT)
       # ========================================================================
-      # Run link checker against the new documentation at deploy-staging/<branch>/.
-      # The deploy-staging/ directory includes all existing versions (from
-      # validation-context/), so lychee can validate cross-version links like
-      # references to stable/, other version numbers, etc.
+      # For link validation, we need the full context (existing versions) so
+      # lychee can resolve cross-version references. So we:
+      # 1. Build a temporary validation structure with both old and new content
+      # 2. Run lychee only against the NEW content  
+      # 3. Clean up the temporary structure
       # ========================================================================
+      - name: Build full validation context
+        run: |
+          branch="${{ steps.branch.outputs.branch_name }}"
+
+          # Build validation structure: start with existing versions
+          mkdir -p full-context/server
+          cp -r validation-context/server/* full-context/server/ || true
+
+          # Merge in the new artifacts
+          mkdir -p "full-context/server/${branch}"
+          cp -r "deploy-staging/${branch}/"* "full-context/server/${branch}/" || true
+
+          echo "Validation structure ready:"
+          find full-context -type d -maxdepth 2
+
       - name: Check for broken links with lychee
         uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2.8.0
         with:
@@ -375,15 +384,17 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           jobSummary: true
           args: |
-            --root-dir $(pwd)/deploy-staging
-            --exclude 'file://$(pwd)/deploy-staging/builds'
-            --exclude 'file://$(pwd)/deploy-staging/projects'
+            --root-dir $(pwd)/full-context
             --offline
             --no-progress
-            --remap 'https://docs.nextcloud.com/server/ file://$(pwd)/deploy-staging/server/'
+            --remap 'https://docs.nextcloud.com/server/ file://$(pwd)/full-context/server/'
             --exclude 'mailto:'
             --exclude-path '.*/404\.html'
-            'deploy-staging/server/${{ steps.branch.outputs.branch_name }}/**/*.html'
+            'full-context/server/${{ steps.branch.outputs.branch_name }}/**/*.html'
+
+      - name: Clean up validation context
+        if: always()
+        run: rm -rf full-context
 
   # ============================================================================
   # DEPLOY
@@ -420,37 +431,47 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: gh-pages
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
 
       - name: Download staged artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: staged-site
-          path: deploy-staging/
+          name: staged-documentation-${{ needs.stage-and-check.outputs.branch_name }}
+          path: stage/
 
       # ========================================================================
       # APPLY STAGED ARTIFACTS TO GH-PAGES
       # ========================================================================
       # Strategy:
-      # - Copy from deploy-staging/ to server/<branch_name>/
+      # - Copy from stage/<branch_name>/ to server/<branch_name>/
       # - If version_name is set, ALSO copy to server/<version_name>/
       # - This allows the highest stable to live in both locations
       # ========================================================================
       - name: Apply staged artifacts to gh-pages
+        id: apply
         run: |
           branch="${{ needs.stage-and-check.outputs.branch_name }}"
           additional="${{ needs.stage-and-check.outputs.additional_deployment }}"
 
+          changed=0
+
+          # Deploy to primary branch folder
           echo "Deploying to server/${branch}/"
-          rm -rf "server/${branch}"
-          cp -r deploy-staging "server/${branch}"
+          if [ -d "stage/${branch}" ]; then
+            rm -rf "server/${branch}"
+            mkdir -p "server/${branch}"
+            cp -r "stage/${branch}/"* "server/${branch}/" || true
+            changed=1
+          fi
 
           # If this is the highest stable branch, also deploy to its versioned folder
           if [ -n "${additional}" ]; then
             echo "Also deploying to server/${additional}/ (additional versioned deployment)"
             rm -rf "server/${additional}"
-            cp -r deploy-staging "server/${additional}"
+            mkdir -p "server/${additional}"
+            cp -r "stage/${branch}/"* "server/${additional}/" || true
+            changed=1
           fi
 
           # Clean up empty directories
@@ -460,19 +481,27 @@ jobs:
           echo "Final server/ structure:"
           find server -type d -maxdepth 2
 
+          # Check if there are actual changes
+          if git diff --quiet HEAD; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Create Pull Request for documentation deployment
         uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0 # v8.1.0
         id: cpr
+        if: steps.apply.outputs.has_changes == 'true'
         with:
           token: ${{ secrets.COMMAND_BOT_PAT }}
-          commit-message: "chore: deploy documentation for ${{ needs.stage-and-check.outputs.branch_name }}"
+          commit-message: "chore: update documentation for ${{ needs.stage-and-check.outputs.branch_name }}"
           committer: nextcloud-command <nextcloud-command@users.noreply.github.com>
           author: nextcloud-command <nextcloud-command@users.noreply.github.com>
           signoff: true
           branch: "automated/deploy/documentation-${{ needs.stage-and-check.outputs.branch_name }}"
           base: gh-pages
-          title: "Deploy documentation for ${{ needs.stage-and-check.outputs.branch_name }}"
-          body: "Automated documentation deployment from branch ${{ github.ref_name }}"
+          title: "Documentation update for ${{ needs.stage-and-check.outputs.branch_name }}"
+          body: "Automated documentation update from branch ${{ github.ref_name }}"
           delete-branch: true
           labels: "automated, 3. to review"
 
