@@ -398,6 +398,7 @@ jobs:
             --no-progress
             --remap 'https://docs.nextcloud.com/server/ file://$(pwd)/full-context/server/'
             --exclude 'mailto:'
+            --exclude '(https?:/?/?)?$'
             --exclude-path '.*/404\.html'
             'full-context/server/${{ steps.branch.outputs.branch_name }}/**/*.html'
 
