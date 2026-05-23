@@ -1,0 +1,81 @@
+{
+  "name": "daily-report",
+  "nodes": [
+    {
+      "name": "Her Gün 19:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 19 * * 1-5" }]
+        }
+      }
+    },
+    {
+      "name": "Tüm Kullanıcıları Getir",
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1,
+      "position": [420, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT id, name, email FROM users WHERE is_active = 1"
+      }
+    },
+    {
+      "name": "Her Kullanıcı İçin",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 1,
+      "position": [640, 300],
+      "parameters": { "batchSize": 1, "options": {} }
+    },
+    {
+      "name": "Kullanıcı İstatistikleri",
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1,
+      "position": [860, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT SUM(duration_sec) AS toplam, SUM(CASE WHEN is_idle=0 THEN duration_sec ELSE 0 END) AS aktif, SUM(CASE WHEN is_idle=1 THEN duration_sec ELSE 0 END) AS bosta FROM activity_logs WHERE user_id = {{$json.id}} AND CAST(logged_at AS DATE) = CAST(GETDATE() AS DATE)"
+      }
+    },
+    {
+      "name": "Top Uygulamalar",
+      "type": "n8n-nodes-base.microsoftSql",
+      "typeVersion": 1,
+      "position": [860, 500],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT TOP 5 app_name, SUM(duration_sec) AS sn FROM activity_logs WHERE user_id = {{$json.id}} AND CAST(logged_at AS DATE) = CAST(GETDATE() AS DATE) AND is_idle = 0 AND app_name IS NOT NULL GROUP BY app_name ORDER BY sn DESC"
+      }
+    },
+    {
+      "name": "Telegram Mesajı Oluştur",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1080, 300],
+      "parameters": {
+        "functionCode": "const stats = $('Kullanıcı İstatistikleri').first().json;\nconst apps  = $('Top Uygulamalar').all();\nconst fmt = (s) => `${Math.floor(s/3600)}s ${Math.floor((s%3600)/60)}dk`;\n\nlet appLines = apps.map(a => `   ${a.json.app_name.padEnd(15)} ${fmt(a.json.sn)}`).join('\\n');\n\nconst msg = `📊 Günlük Özet\\n\\n⏱ Aktif: ${fmt(stats.aktif || 0)}\\n😴 Boşta: ${fmt(stats.bosta || 0)}\\n\\n💻 Top Uygulamalar:\\n${appLines || '   Veri yok'}`;\n\nreturn [{ json: { text: msg, chat_id: 'TELEGRAM_CHAT_ID_BURAYA' } }];"
+      }
+    },
+    {
+      "name": "Telegram Gönder",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1,
+      "position": [1300, 300],
+      "parameters": {
+        "chatId": "={{$json.chat_id}}",
+        "text": "={{$json.text}}",
+        "additionalFields": {}
+      }
+    }
+  ],
+  "connections": {
+    "Her Gün 19:00":         { "main": [[{ "node": "Tüm Kullanıcıları Getir", "type": "main", "index": 0 }]] },
+    "Tüm Kullanıcıları Getir": { "main": [[{ "node": "Her Kullanıcı İçin", "type": "main", "index": 0 }]] },
+    "Her Kullanıcı İçin":    { "main": [[{ "node": "Kullanıcı İstatistikleri", "type": "main", "index": 0 }, { "node": "Top Uygulamalar", "type": "main", "index": 0 }]] },
+    "Top Uygulamalar":       { "main": [[{ "node": "Telegram Mesajı Oluştur", "type": "main", "index": 0 }]] },
+    "Telegram Mesajı Oluştur": { "main": [[{ "node": "Telegram Gönder", "type": "main", "index": 0 }]] }
+  },
+  "_comment": "Kurulum: 1) Telegram Bot Token'ı n8n Credentials'a ekle. 2) Her kullanıcı için chat_id'yi users tablosuna ekle (telegram_chat_id kolonu). 3) SQL sorgularını güncelleyin."
+}

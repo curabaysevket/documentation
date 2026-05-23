@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Aktivite Takip",
+  "version": "1.0.0",
+  "description": "Web kullanım süresi ve site kategorisini n8n'e gönderir",
+  "permissions": ["tabs", "activeTab", "storage", "alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Aktivite Takip"
+  }
+}
